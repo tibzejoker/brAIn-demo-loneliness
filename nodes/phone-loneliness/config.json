@@ -1,0 +1,28 @@
+{
+  "name": "phone-loneliness",
+  "description": "Detects when a brAIn-mobile phone has been put down (accelerometer steady within ±max_range over window_ms), then asks an LLM for a passive-aggressive English one-liner every utterance_period_ms and pushes it to the device's TTS — until the phone moves again.",
+  "tags": ["demo", "fun", "mobile", "llm", "tts"],
+  "default_authority": 1,
+  "default_priority": 4,
+  "default_subscriptions": [
+    {
+      "topic": "mobile.*.sensor.accel",
+      "description": "Accelerometer stream from any connected brAIn-mobile phone. Used to decide if the phone is still or in motion.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": { "type": "number" },
+          "y": { "type": "number" },
+          "z": { "type": "number" },
+          "t": { "type": "number" }
+        }
+      }
+    }
+  ],
+  "default_publishes": [
+    "phone-loneliness.status",
+    "mobile.*.tts.speak"
+  ],
+  "has_ui": true,
+  "supports_transport": ["process"]
+}

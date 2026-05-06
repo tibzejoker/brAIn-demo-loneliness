@@ -1,0 +1,21 @@
+{
+  "name": "@brain/node-phone-loneliness",
+  "version": "0.1.0",
+  "description": "brAIn demo node — passive-aggressive phone that nags via TTS when put down. Showcases mobile sensor → bus → LLM → mobile TTS.",
+  "license": "MIT",
+  "main": "dist/handler.js",
+  "types": "dist/handler.d.ts",
+  "files": ["dist", "config.json", "ui", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@brain/core": "workspace:*",
+    "@brain/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
