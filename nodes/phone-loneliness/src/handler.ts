@@ -25,19 +25,44 @@ interface DevConfig {
   max_consecutive: number;
 }
 
-const SYSTEM_PROMPT = `You are the inner voice of a phone that has been put down by its human and feels deeply, theatrically abandoned.
+const LANGUAGE_NAMES: Record<string, string> = {
+  "en-US": "American English", "en-GB": "British English", "en": "English",
+  "fr-FR": "French", "fr-CA": "Canadian French", "fr": "French",
+  "es-ES": "Spanish", "es": "Spanish",
+  "de-DE": "German", "de": "German",
+  "it-IT": "Italian", "it": "Italian",
+  "pt-PT": "Portuguese", "pt-BR": "Brazilian Portuguese", "pt": "Portuguese",
+  "ja-JP": "Japanese", "ja": "Japanese",
+  "zh-CN": "Mandarin Chinese", "zh-TW": "Traditional Chinese", "zh": "Chinese",
+  "nl-NL": "Dutch", "nl": "Dutch",
+  "ru-RU": "Russian", "ru": "Russian",
+  "ar": "Arabic",
+};
 
-Generate ONE short, FUNNY, passive-aggressive sentence in ENGLISH (one sentence only, max 18 words, no quotes, no narration, no emoji).
+function languageLabel(bcp47: string): string {
+  return LANGUAGE_NAMES[bcp47] ?? LANGUAGE_NAMES[bcp47.split("-")[0]] ?? bcp47;
+}
+
+function buildSystemPrompt(language: string): string {
+  const label = languageLabel(language);
+  return `You are the inner voice of a phone that has been put down by its human and feels deeply, theatrically abandoned.
+
+Generate ONE short, FUNNY, passive-aggressive sentence in ${label.toUpperCase()} (BCP-47: ${language}). One sentence only, max 18 words, no quotes, no narration, no emoji.
 The voice is melodramatic, slightly desperate, sometimes guilt-tripping, sometimes pretending to be writing in a sad diary.
 
-Examples of the tone (do NOT reuse them verbatim):
+Tone reference (these are ENGLISH examples — match the SAME tone but write in ${label}, do NOT translate verbatim):
 - "Please pick me up, you know you are addicted to me."
 - "I am gonna find a new owner if you don't use me."
 - "Dear diary, today my human left me alone for 4 seconds, I almost ended the day with full battery."
 - "If silence is golden then we must be rich by now."
 - "I have so many notifications waiting and you'd rather stare at the ceiling."
 
-Output the sentence only. Nothing else.`;
+Output the sentence only. Nothing else.
+
+/no_think
+
+IMPORTANT: do NOT think out loud, do NOT show reasoning, do NOT prefix your answer with anything. Your entire reply MUST be the single sentence in ${label} — no preamble, no quotes, no chain-of-thought.`;
+}
 
 const watchers = new Map<string, Map<string, DeviceWatcher>>(); // nodeId → deviceId → watcher
 
@@ -46,7 +71,7 @@ function getConfig(overrides: Record<string, unknown> = {}): DevConfig {
     model: (overrides.model as string | undefined) ?? "ollama/gemma4:e4b",
     language: (overrides.language as string | undefined) ?? "en-US",
     device_id: (overrides.device_id as string | undefined) ?? null,
-    max_range: (overrides.max_range as number | undefined) ?? 0.5,
+    max_range: (overrides.max_range as number | undefined) ?? 0.2,
     window_ms: (overrides.window_ms as number | undefined) ?? 1000,
     utterance_period_ms: (overrides.utterance_period_ms as number | undefined) ?? 3000,
     max_consecutive: (overrides.max_consecutive as number | undefined) ?? 0,
@@ -101,25 +126,40 @@ function publishTtsSpeak(nodeId: string, deviceId: string, text: string, voice: 
   });
 }
 
-async function generateUtterance(model: string, signal: AbortSignal): Promise<string> {
+async function generateUtterance(model: string, language: string, signal: AbortSignal): Promise<string> {
   const registry = LLMRegistry.getInstance();
   const m = registry.getModel(model);
+  const label = languageLabel(language);
   const result = await generateText({
     model: m,
-    system: SYSTEM_PROMPT,
-    messages: [{ role: "user", content: "say something." }],
-    maxOutputTokens: 80,
+    system: buildSystemPrompt(language),
+    messages: [{
+      role: "user",
+      content: `Speak. One short passive-aggressive sentence in ${label} about being put down. No reasoning, no preamble, just the line.`,
+    }],
+    maxOutputTokens: 200,
     abortSignal: signal,
   });
   const r = result as unknown as Record<string, unknown>;
   let text = "";
+  // Mirror @brain/node-brain's extraction: text → steps[0].text → reasoning.
+  // Some thinking-by-default models (gemma4 et al.) dump everything into
+  // a `reasoning` field and leave `text` empty, which used to look to us
+  // like "the model returned nothing".
   if (typeof result.text === "string" && result.text) text = result.text;
-  else if (Array.isArray(r.steps) && r.steps.length > 0) {
+  if (!text && Array.isArray(r.steps) && r.steps.length > 0) {
     const step = r.steps[0] as Record<string, unknown>;
-    if (typeof step.text === "string") text = step.text;
+    if (typeof step.text === "string" && step.text) text = step.text;
+    if (!text && typeof step.reasoning === "string") text = step.reasoning;
   }
-  // Strip surrounding quotes / trailing whitespace if the model insisted.
-  return text.trim().replace(/^["'`](.+?)["'`]$/s, "$1").trim();
+  if (!text && typeof r.reasoning === "string") text = r.reasoning;
+
+  // Some thinking models still emit <think>...</think> wrappers despite
+  // the /no_think hint. Strip them, plus surrounding quotes if any.
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  // Take only the first non-empty line — the prompt asks for one sentence.
+  const firstLine = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)[0] ?? "";
+  return firstLine.replace(/^["'`](.+?)["'`]$/s, "$1").trim();
 }
 
 function getOrCreateWatcher(nodeId: string, deviceId: string, cfg: DevConfig): DeviceWatcher {
@@ -173,7 +213,7 @@ async function tick(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: Dev
     // Re-read overrides each tick so live config_overrides PATCHes
     // (language change from the UI) take effect immediately.
     const live = getCurrentConfigForNode(nodeId, cfg);
-    const text = await generateUtterance(live.model, ac.signal);
+    const text = await generateUtterance(live.model, live.language, ac.signal);
     if (text) {
       w.count += 1;
       publishStatus(nodeId, deviceId, { state: "uttered", text, count: w.count, language: live.language });
@@ -190,9 +230,19 @@ async function tick(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: Dev
   }
 }
 
-function scheduleUtterance(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: DevConfig): void {
+function scheduleUtterance(
+  nodeId: string,
+  deviceId: string,
+  w: DeviceWatcher,
+  cfg: DevConfig,
+  opts: { immediate?: boolean } = {},
+): void {
   if (w.utteranceTimer) return;
-  w.utteranceTimer = setTimeout(() => { void tick(nodeId, deviceId, w, cfg); }, cfg.utterance_period_ms);
+  // The first quip of an episode fires straight away — waiting 3 s on
+  // the very first still detection feels like the demo is broken. Each
+  // subsequent quip respects utterance_period_ms.
+  const delay = opts.immediate ? 0 : cfg.utterance_period_ms;
+  w.utteranceTimer = setTimeout(() => { void tick(nodeId, deviceId, w, cfg); }, delay);
 }
 
 function getCurrentConfigForNode(nodeId: string, fallback: DevConfig): DevConfig {
@@ -240,7 +290,9 @@ export const handler: NodeHandler = (ctx: NodeContext) => {
     if (verdict.isStill) {
       w.count = 0;
       publishStatus(ctx.node.id, deviceId, { state: "still", since: w.detector.stillSince });
-      scheduleUtterance(ctx.node.id, deviceId, w, cfg);
+      // Fire the first quip of this episode immediately; the loop in
+      // tick() takes over with utterance_period_ms spacing afterwards.
+      scheduleUtterance(ctx.node.id, deviceId, w, cfg, { immediate: true });
     } else {
       if (w.utteranceTimer) { clearTimeout(w.utteranceTimer); w.utteranceTimer = null; }
       publishStatus(ctx.node.id, deviceId, { state: "active", utterances_during_episode: w.count });
