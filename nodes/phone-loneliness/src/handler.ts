@@ -148,39 +148,51 @@ function clearAllWatchers(nodeId: string): void {
   watchers.delete(nodeId);
 }
 
-function scheduleUtterance(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: DevConfig): void {
-  if (w.utteranceTimer) return;
-  w.utteranceTimer = setTimeout(async () => {
-    w.utteranceTimer = null;
-    if (!w.detector.isStill) return; // user picked up between scheduling and firing
-    if (cfg.max_consecutive > 0 && w.count >= cfg.max_consecutive) {
-      publishStatus(nodeId, deviceId, { state: "exhausted", count: w.count });
-      return;
-    }
-    if (w.inflight) {
-      // Previous LLM still cooking — don't queue, just retry next cycle.
-      scheduleUtterance(nodeId, deviceId, w, cfg);
-      return;
-    }
-    w.inflight = true;
-    const ac = new AbortController();
-    try {
-      // Re-read overrides each tick so live config_overrides PATCHes
-      // (language change from the UI) take effect immediately.
-      const live = getCurrentConfigForNode(nodeId, cfg);
-      const text = await generateUtterance(live.model, ac.signal);
-      if (!text) return;
+/**
+ * One quip cycle: ask the LLM, publish, requeue. The reschedule lives in
+ * a `finally` so an empty model output, a failed publish, or any other
+ * non-fatal hiccup can't kill the loop — the only exits are: phone
+ * moved, max_consecutive hit, or the node being torn down. Earlier the
+ * loop died silently if the model returned an empty string.
+ */
+async function tick(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: DevConfig): Promise<void> {
+  w.utteranceTimer = null;
+  if (!w.detector.isStill) return;
+  if (cfg.max_consecutive > 0 && w.count >= cfg.max_consecutive) {
+    publishStatus(nodeId, deviceId, { state: "exhausted", count: w.count });
+    return;
+  }
+  if (w.inflight) {
+    // Previous LLM still cooking — don't queue, just retry next cycle.
+    scheduleUtterance(nodeId, deviceId, w, cfg);
+    return;
+  }
+  w.inflight = true;
+  const ac = new AbortController();
+  try {
+    // Re-read overrides each tick so live config_overrides PATCHes
+    // (language change from the UI) take effect immediately.
+    const live = getCurrentConfigForNode(nodeId, cfg);
+    const text = await generateUtterance(live.model, ac.signal);
+    if (text) {
       w.count += 1;
       publishStatus(nodeId, deviceId, { state: "uttered", text, count: w.count, language: live.language });
       publishTtsSpeak(nodeId, deviceId, text, live.language);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      publishStatus(nodeId, deviceId, { state: "error", error: message });
-    } finally {
-      w.inflight = false;
+    } else {
+      publishStatus(nodeId, deviceId, { state: "error", error: "model returned empty output" });
     }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    publishStatus(nodeId, deviceId, { state: "error", error: message });
+  } finally {
+    w.inflight = false;
     if (w.detector.isStill) scheduleUtterance(nodeId, deviceId, w, cfg);
-  }, cfg.utterance_period_ms);
+  }
+}
+
+function scheduleUtterance(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: DevConfig): void {
+  if (w.utteranceTimer) return;
+  w.utteranceTimer = setTimeout(() => { void tick(nodeId, deviceId, w, cfg); }, cfg.utterance_period_ms);
 }
 
 function getCurrentConfigForNode(nodeId: string, fallback: DevConfig): DevConfig {
