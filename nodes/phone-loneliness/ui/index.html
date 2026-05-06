@@ -90,9 +90,12 @@
           <option value="ja-JP">日本語</option>
         </select>
       </div>
-      <div class="lang-row" style="border-bottom: 1px solid var(--border);">
-        <label for="period">Every</label>
-        <input type="number" id="period" min="1" max="60" step="1" style="width: 60px;" /> <span class="hint">s</span>
+      <div class="lang-row" style="border-bottom: 1px solid var(--border); justify-content: space-between;">
+        <div style="display: flex; gap: 6px; align-items: center;">
+          <label for="period">Every</label>
+          <input type="number" id="period" min="1" max="60" step="1" style="width: 60px;" /> <span class="hint">s</span>
+        </div>
+        <div class="hint" id="cache-badge">cache —</div>
       </div>
       <div class="pane-body" id="devices">
         <div class="empty">No phone has reported yet. Connect brAIn-mobile and put the phone on a table.</div>
@@ -164,6 +167,10 @@
     els.lang.addEventListener('change', () => {
       language = els.lang.value;
       patchConfig({ language });
+      // Refresh the badge against whatever we last saw for the new lang.
+      updateCacheBadge(language,
+        cacheByLang.get(language)?.size ?? 0,
+        cacheByLang.get(language)?.inflight ?? 0);
     });
 
     els.period.addEventListener('change', () => {
@@ -198,6 +205,11 @@
       const meta = msg.metadata || {};
       const deviceId = meta.deviceId;
       if (!deviceId) return;
+      // Cache pseudo-device — surfaced separately, not in the device list.
+      if (deviceId.startsWith('__')) {
+        if (meta.state === 'cache.size') updateCacheBadge(meta.language, meta.size, meta.inflight);
+        return;
+      }
       const cur = devices.get(deviceId) ?? { state: 'unknown', count: 0, language: 'en-US' };
       cur.state = meta.state ?? cur.state;
       cur.count = meta.count ?? cur.count;
@@ -230,6 +242,17 @@
           </div>
         `;
         els.devices.appendChild(div);
+      }
+    }
+
+    const cacheByLang = new Map();
+    function updateCacheBadge(lang, size, inflight) {
+      cacheByLang.set(lang, { size: Number(size) || 0, inflight: Number(inflight) || 0 });
+      const cur = cacheByLang.get(language) ?? { size: 0, inflight: 0 };
+      const badge = document.getElementById('cache-badge');
+      if (badge) {
+        const il = cur.inflight > 0 ? ` (+${cur.inflight} cooking)` : '';
+        badge.textContent = `cache ${cur.size}${il}`;
       }
     }
 

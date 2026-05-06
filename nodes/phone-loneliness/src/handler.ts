@@ -23,6 +23,10 @@ interface DevConfig {
   utterance_period_ms: number;
   /** 0 = no cap; otherwise stop after N utterances per stillness episode. */
   max_consecutive: number;
+  /** Target number of pre-generated quips per language in the cache. */
+  cache_target: number;
+  /** How many parallel LLM refills can run for a single language. */
+  cache_max_inflight: number;
 }
 
 const LANGUAGE_NAMES: Record<string, string> = {
@@ -75,7 +79,88 @@ function getConfig(overrides: Record<string, unknown> = {}): DevConfig {
     window_ms: (overrides.window_ms as number | undefined) ?? 1000,
     utterance_period_ms: (overrides.utterance_period_ms as number | undefined) ?? 3000,
     max_consecutive: (overrides.max_consecutive as number | undefined) ?? 0,
+    cache_target: (overrides.cache_target as number | undefined) ?? 5,
+    cache_max_inflight: (overrides.cache_max_inflight as number | undefined) ?? 2,
   };
+}
+
+// ── Quip cache ────────────────────────────────────────────────────────
+// nodeId → language → ready-to-speak quips. Switching languages keeps
+// other entries intact (cheap to revisit later) and only refills the
+// active one. Refills run in parallel with the publish to mobile so the
+// device hears a quip "tac o tac" while the next one is being prepared.
+
+interface NodeCache {
+  byLang: Map<string, string[]>;
+  inflight: Map<string, number>; // language → count of LLM calls in flight
+}
+
+const caches = new Map<string, NodeCache>();
+
+function getCache(nodeId: string): NodeCache {
+  let c = caches.get(nodeId);
+  if (!c) {
+    c = { byLang: new Map(), inflight: new Map() };
+    caches.set(nodeId, c);
+  }
+  return c;
+}
+
+function cacheSize(nodeId: string, language: string): number {
+  return getCache(nodeId).byLang.get(language)?.length ?? 0;
+}
+
+function popQuip(nodeId: string, language: string): string | null {
+  const queue = getCache(nodeId).byLang.get(language);
+  if (!queue || queue.length === 0) return null;
+  return queue.shift() ?? null;
+}
+
+/**
+ * Top up `language`'s queue to `cache_target`, scheduling up to
+ * `cache_max_inflight` LLM calls in parallel. Idempotent — concurrent
+ * callers see the same in-flight counter and don't over-shoot.
+ */
+function refillCache(nodeId: string, model: string, language: string, cfg: DevConfig): void {
+  const c = getCache(nodeId);
+  let queue = c.byLang.get(language);
+  if (!queue) { queue = []; c.byLang.set(language, queue); }
+  const inflight = c.inflight.get(language) ?? 0;
+  const need = cfg.cache_target - queue.length - inflight;
+  if (need <= 0) return;
+  const toLaunch = Math.min(need, cfg.cache_max_inflight - inflight);
+  if (toLaunch <= 0) return;
+  c.inflight.set(language, inflight + toLaunch);
+  for (let i = 0; i < toLaunch; i++) {
+    void (async (): Promise<void> => {
+      try {
+        const text = await generateUtterance(model, language, new AbortController().signal);
+        if (text && c.byLang.get(language) === queue) queue.push(text);
+      } catch (err) {
+        publishStatus(nodeId, "__cache__", {
+          state: "cache.error",
+          language,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        c.inflight.set(language, Math.max(0, (c.inflight.get(language) ?? 1) - 1));
+        publishStatus(nodeId, "__cache__", {
+          state: "cache.size",
+          language,
+          size: queue.length,
+          inflight: c.inflight.get(language) ?? 0,
+        });
+        // Chain — if the queue still isn't full and we have spare slots,
+        // spin up another refill round.
+        const live = getCurrentConfigForNode(nodeId, cfg);
+        if (live.language === language) refillCache(nodeId, live.model, language, live);
+      }
+    })();
+  }
+}
+
+function clearCache(nodeId: string): void {
+  caches.delete(nodeId);
 }
 
 function deviceFromTopic(topic: string): string | null {
@@ -208,16 +293,33 @@ async function tick(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: Dev
     return;
   }
   w.inflight = true;
-  const ac = new AbortController();
   try {
     // Re-read overrides each tick so live config_overrides PATCHes
     // (language change from the UI) take effect immediately.
     const live = getCurrentConfigForNode(nodeId, cfg);
-    const text = await generateUtterance(live.model, live.language, ac.signal);
+
+    // Try the cache first — that's what makes successive quips feel
+    // tac-au-tac. On miss, fall back to a live LLM call so we never
+    // skip a tick (e.g. very first put-down before the spawn pre-warm
+    // had time to land).
+    let text = popQuip(nodeId, live.language);
+    let source: "cache" | "live" = "cache";
+    if (!text) {
+      source = "live";
+      const ac = new AbortController();
+      text = await generateUtterance(live.model, live.language, ac.signal);
+    }
+
     if (text) {
       w.count += 1;
-      publishStatus(nodeId, deviceId, { state: "uttered", text, count: w.count, language: live.language });
+      publishStatus(nodeId, deviceId, {
+        state: "uttered", text, count: w.count, language: live.language, source,
+        cache_size: cacheSize(nodeId, live.language),
+      });
       publishTtsSpeak(nodeId, deviceId, text, live.language);
+      // Refill in parallel with the TTS hitting the phone — by the time
+      // the user hears this quip, the next one is already cooking.
+      refillCache(nodeId, live.model, live.language, live);
     } else {
       publishStatus(nodeId, deviceId, { state: "error", error: "model returned empty output" });
     }
@@ -254,10 +356,16 @@ function getCurrentConfigForNode(nodeId: string, fallback: DevConfig): DevConfig
 export const onSpawn: NodeOnSpawn = (info: NodeInfo) => {
   // Ensure the watcher map slot exists and is empty for this instance.
   watchers.set(info.id, new Map());
+  // Pre-warm the cache for the configured language so the first
+  // put-down has zero LLM latency. Fire-and-forget — refillCache caps
+  // concurrency on its own.
+  const cfg = getConfig(info.config_overrides ?? {});
+  refillCache(info.id, cfg.model, cfg.language, cfg);
 };
 
 export const teardown: NodeTeardown = (info: NodeInfo) => {
   clearAllWatchers(info.id);
+  clearCache(info.id);
 };
 
 export const handler: NodeHandler = (ctx: NodeContext) => {
@@ -275,6 +383,12 @@ export const handler: NodeHandler = (ctx: NodeContext) => {
 
     const sample = parseSample(msg);
     if (!sample) continue;
+
+    // Keep the cache for the *current* language warm. Cheap — refillCache
+    // bails immediately if we're already at target or capped on inflight
+    // — so calling it on every accel sample is fine and gives instant
+    // catch-up when the user toggles the language dropdown.
+    refillCache(ctx.node.id, cfg.model, cfg.language, cfg);
 
     const w = getOrCreateWatcher(ctx.node.id, deviceId, cfg);
     if (!w.announced) {
