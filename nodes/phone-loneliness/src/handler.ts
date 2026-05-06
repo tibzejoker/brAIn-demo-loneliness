@@ -335,6 +335,98 @@ function clearRecentQuips(nodeId: string): void {
   recentQuips.delete(nodeId);
 }
 
+// ── Pickup-line cache ─────────────────────────────────────────────────
+// Separate, smaller cache for the relieved/sarcastic line spoken once
+// when the user picks the phone back up. Pre-warmed alongside the main
+// cache. Pop one on transition still→active, refill in background.
+
+const pickupCache = new Map<string, Map<string, string[]>>();
+const PICKUP_CACHE_TARGET = 3;
+const PICKUP_INFLIGHT = new Map<string, Set<string>>(); // nodeId|lang → in-flight set of refill ids
+
+function getPickupQueue(nodeId: string, language: string): string[] {
+  let perNode = pickupCache.get(nodeId);
+  if (!perNode) { perNode = new Map(); pickupCache.set(nodeId, perNode); }
+  let q = perNode.get(language);
+  if (!q) { q = []; perNode.set(language, q); }
+  return q;
+}
+
+function popPickup(nodeId: string, language: string): string | null {
+  const q = getPickupQueue(nodeId, language);
+  return q.shift() ?? null;
+}
+
+function clearPickupCache(nodeId: string): void {
+  pickupCache.delete(nodeId);
+  for (const k of [...PICKUP_INFLIGHT.keys()]) {
+    if (k.startsWith(`${nodeId}|`)) PICKUP_INFLIGHT.delete(k);
+  }
+}
+
+function pickupSystemPrompt(language: string): string {
+  const label = languageLabel(language);
+  return `You are the inner voice of a phone whose human has JUST PICKED IT UP after a stretch of being abandoned on a surface.
+
+Reply with ONE short sentence in ${label.toUpperCase()} (BCP-47: ${language}). The tone is one of these — pick at random, do not always default to the same one:
+- relieved-sassy ("ah, you came back, don't you DARE put me down again")
+- guilt-tripping ("the warmth of your hand is reassuring — try to ignore me again and I leak your search history")
+- mock-grateful ("at last, you're being reasonable")
+- territorial ("about time — your tablet was making eyes at me")
+
+Max 18 words. No quotes, no narration, no emoji, no chain-of-thought.
+/no_think
+
+Output the sentence only.`;
+}
+
+async function generatePickup(model: string, language: string, signal: AbortSignal): Promise<string> {
+  const registry = LLMRegistry.getInstance();
+  const m = registry.getModel(model);
+  const label = languageLabel(language);
+  const result = await generateText({
+    model: m,
+    system: pickupSystemPrompt(language),
+    messages: [{ role: "user", content: `Speak. One short sentence in ${label} reacting to being picked back up. No reasoning, just the line.` }],
+    maxOutputTokens: 200,
+    abortSignal: signal,
+  });
+  const r = result as unknown as Record<string, unknown>;
+  let text = "";
+  if (typeof result.text === "string" && result.text) text = result.text;
+  if (!text && Array.isArray(r.steps) && r.steps.length > 0) {
+    const step = r.steps[0] as Record<string, unknown>;
+    if (typeof step.text === "string" && step.text) text = step.text;
+    if (!text && typeof step.reasoning === "string") text = step.reasoning;
+  }
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  const firstLine = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)[0] ?? "";
+  return firstLine.replace(/^["'`](.+?)["'`]$/s, "$1").trim();
+}
+
+function refillPickupCache(nodeId: string, model: string, language: string): void {
+  const q = getPickupQueue(nodeId, language);
+  const key = `${nodeId}|${language}`;
+  let inflight = PICKUP_INFLIGHT.get(key);
+  if (!inflight) { inflight = new Set(); PICKUP_INFLIGHT.set(key, inflight); }
+  while (q.length + inflight.size < PICKUP_CACHE_TARGET) {
+    const id = `${Date.now()}-${Math.random()}`;
+    inflight.add(id);
+    void (async (): Promise<void> => {
+      try {
+        const text = await generatePickup(model, language, new AbortController().signal);
+        if (text) q.push(text);
+      } catch (_err) { /* swallow — pickup is best-effort */ }
+      finally { inflight!.delete(id); }
+    })();
+  }
+}
+
+function publishPickup(nodeId: string, deviceId: string, text: string, voice: string): void {
+  publishStatus(nodeId, deviceId, { state: "pickup", text, language: voice });
+  publishTtsSpeak(nodeId, deviceId, text, voice);
+}
+
 async function generateUtterance(
   model: string,
   language: string,
@@ -516,17 +608,18 @@ function getCurrentConfigForNode(nodeId: string, fallback: DevConfig): DevConfig
 export const onSpawn: NodeOnSpawn = (info: NodeInfo) => {
   // Ensure the watcher map slot exists and is empty for this instance.
   watchers.set(info.id, new Map());
-  // Pre-warm the cache for the configured language so the first
-  // put-down has zero LLM latency. Fire-and-forget — refillCache caps
-  // concurrency on its own.
+  // Pre-warm both caches for the configured language so the first
+  // put-down AND the first pickup-line have zero LLM latency.
   const cfg = getConfig(info.config_overrides ?? {});
   refillCache(info.id, cfg.model, cfg.language, cfg);
+  refillPickupCache(info.id, cfg.model, cfg.language);
 };
 
 export const teardown: NodeTeardown = (info: NodeInfo) => {
   clearAllWatchers(info.id);
   clearCache(info.id);
   clearRecentQuips(info.id);
+  clearPickupCache(info.id);
 };
 
 export const handler: NodeHandler = (ctx: NodeContext) => {
@@ -571,11 +664,12 @@ export const handler: NodeHandler = (ctx: NodeContext) => {
     const sample = parseSample(msg);
     if (!sample) continue;
 
-    // Keep the cache for the *current* language warm. Cheap — refillCache
-    // bails immediately if we're already at target or capped on inflight
-    // — so calling it on every accel sample is fine and gives instant
-    // catch-up when the user toggles the language dropdown.
+    // Keep both caches warm for the current language. Both helpers
+    // bail immediately when at target / capped, so calling them on
+    // every accel sample is cheap and gives instant catch-up when the
+    // user toggles the language dropdown.
     refillCache(ctx.node.id, cfg.model, cfg.language, cfg);
+    refillPickupCache(ctx.node.id, cfg.model, cfg.language);
 
     const w = getOrCreateWatcher(ctx.node.id, deviceId, cfg);
     if (!w.announced) {
@@ -604,6 +698,17 @@ export const handler: NodeHandler = (ctx: NodeContext) => {
       // torch isn't left on in a random state.
       stopFlashDance(ctx.node.id, deviceId, w);
       publishStatus(ctx.node.id, deviceId, { state: "active", utterances_during_episode: w.count });
+      // One sassy / relieved pickup line, only if we actually nagged the
+      // user during this episode (don't bother if the phone barely
+      // rested). Pulled from the dedicated pickup cache; falls back to
+      // a hardcoded line if cache is empty.
+      if (w.count > 0) {
+        const line = popPickup(ctx.node.id, cfg.language)
+          ?? "Ah, you came back. Don't even think of putting me down again.";
+        publishPickup(ctx.node.id, deviceId, line, cfg.language);
+        // Refill so the next pickup is also instant.
+        refillPickupCache(ctx.node.id, cfg.model, cfg.language);
+      }
       w.count = 0;
     }
   }
