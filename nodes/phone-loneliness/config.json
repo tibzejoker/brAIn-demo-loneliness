@@ -6,8 +6,8 @@
   "default_priority": 4,
   "default_subscriptions": [
     {
-      "topic": "mobile.*.sensor.accel",
-      "description": "Accelerometer stream from any connected brAIn-mobile phone. Used to decide if the phone is still or in motion.",
+      "topic": "mobile.*",
+      "description": "Greedy prefix that picks up every brAIn-mobile topic. We only act on `mobile.<id>.sensor.accel` — but brAIn's topic matcher requires the wildcard at the tail, so we filter inside the handler.",
       "inputSchema": {
         "type": "object",
         "properties": {

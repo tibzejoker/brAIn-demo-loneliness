@@ -7,6 +7,8 @@ interface DeviceWatcher {
   utteranceTimer: NodeJS.Timeout | null;
   inflight: boolean;
   count: number;
+  /** Have we emitted the initial "tracking" status for this device yet? */
+  announced: boolean;
 }
 
 interface DevConfig {
@@ -130,6 +132,7 @@ function getOrCreateWatcher(nodeId: string, deviceId: string, cfg: DevConfig): D
       utteranceTimer: null,
       inflight: false,
       count: 0,
+      announced: false,
     };
     perNode.set(deviceId, w);
   }
@@ -212,6 +215,13 @@ export const handler: NodeHandler = (ctx: NodeContext) => {
     if (!sample) continue;
 
     const w = getOrCreateWatcher(ctx.node.id, deviceId, cfg);
+    if (!w.announced) {
+      // Surface the device in the UI immediately, before we have enough
+      // samples to make a stillness call. Otherwise the panel sits on
+      // "No phone has reported yet" until the first transition fires.
+      w.announced = true;
+      publishStatus(ctx.node.id, deviceId, { state: "tracking" });
+    }
     const verdict = w.detector.feed(sample);
     if (!verdict.changed) continue;
 
