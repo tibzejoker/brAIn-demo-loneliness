@@ -9,6 +9,14 @@ interface DeviceWatcher {
   count: number;
   /** Have we emitted the initial "tracking" status for this device yet? */
   announced: boolean;
+  /**
+   * Set after we publish a tts.speak — gates the next utterance on the
+   * phone reporting back `mobile.<id>.tts.status {state: spoken}`. So
+   * `utterance_period_ms` measures the gap between the END of one quip
+   * and the START of the next, instead of the gap between two `tts.speak`
+   * publishes. The watchdog frees us if the phone never reports back.
+   */
+  awaitingTts: { sentAt: number; watchdog: NodeJS.Timeout } | null;
 }
 
 interface DevConfig {
@@ -182,9 +190,13 @@ function publishCacheSnapshot(nodeId: string, c: NodeCache, target: number): voi
   });
 }
 
-function deviceFromTopic(topic: string): string | null {
-  // mobile.<deviceId>.sensor.accel
+function deviceFromAccelTopic(topic: string): string | null {
   const m = topic.match(/^mobile\.([^.]+)\.sensor\.accel$/);
+  return m ? m[1] : null;
+}
+
+function deviceFromTtsStatusTopic(topic: string): string | null {
+  const m = topic.match(/^mobile\.([^.]+)\.tts\.status$/);
   return m ? m[1] : null;
 }
 
@@ -277,6 +289,7 @@ function getOrCreateWatcher(nodeId: string, deviceId: string, cfg: DevConfig): D
       inflight: false,
       count: 0,
       announced: false,
+      awaitingTts: null,
     };
     perNode.set(deviceId, w);
   }
@@ -288,6 +301,7 @@ function clearAllWatchers(nodeId: string): void {
   if (!perNode) return;
   for (const w of perNode.values()) {
     if (w.utteranceTimer) { clearTimeout(w.utteranceTimer); w.utteranceTimer = null; }
+    if (w.awaitingTts) { clearTimeout(w.awaitingTts.watchdog); w.awaitingTts = null; }
   }
   watchers.delete(nodeId);
 }
@@ -312,6 +326,9 @@ async function tick(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: Dev
     return;
   }
   w.inflight = true;
+  // True once we publish a tts.speak — the spoken-event handler will
+  // own the rescheduling, the `finally` below stays out of the way.
+  let armedTtsWait = false;
   try {
     // Re-read overrides each tick so live config_overrides PATCHes
     // (language change from the UI) take effect immediately.
@@ -336,6 +353,20 @@ async function tick(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: Dev
         cache_size: cacheSize(nodeId, live.language),
       });
       publishTtsSpeak(nodeId, deviceId, text, live.language);
+      // Wait for the phone to confirm it finished speaking before
+      // counting down utterance_period_ms — the spoken-event handler
+      // re-schedules tick(). Watchdog frees us if the device drops
+      // off (mute, network drop, app backgrounded).
+      const watchdog = setTimeout(() => {
+        const cur = watchers.get(nodeId)?.get(deviceId);
+        if (cur?.awaitingTts) {
+          cur.awaitingTts = null;
+          publishStatus(nodeId, deviceId, { state: "tts.timeout", language: live.language });
+          if (cur.detector.isStill) scheduleUtterance(nodeId, deviceId, cur, cfg);
+        }
+      }, 30_000);
+      w.awaitingTts = { sentAt: Date.now(), watchdog };
+      armedTtsWait = true;
       // Refill in parallel with the TTS hitting the phone — by the time
       // the user hears this quip, the next one is already cooking.
       refillCache(nodeId, live.model, live.language, live);
@@ -347,7 +378,9 @@ async function tick(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: Dev
     publishStatus(nodeId, deviceId, { state: "error", error: message });
   } finally {
     w.inflight = false;
-    if (w.detector.isStill) scheduleUtterance(nodeId, deviceId, w, cfg);
+    // Only auto-reschedule when we DIDN'T arm a tts wait (no quip sent
+    // out, or empty / errored). Otherwise the spoken event drives it.
+    if (!armedTtsWait && w.detector.isStill) scheduleUtterance(nodeId, deviceId, w, cfg);
   }
 }
 
@@ -396,7 +429,25 @@ export const handler: NodeHandler = (ctx: NodeContext) => {
   const cfg = getConfig(ctx.node.config_overrides ?? {});
 
   for (const msg of ctx.messages) {
-    const deviceId = deviceFromTopic(msg.topic);
+    // ── TTS completion: phone tells us when it has finished speaking ──
+    const ttsStatusDevice = deviceFromTtsStatusTopic(msg.topic);
+    if (ttsStatusDevice) {
+      if (cfg.device_id && ttsStatusDevice !== cfg.device_id) continue;
+      const meta = msg.metadata as { state?: string } | undefined;
+      const state = meta?.state ?? "";
+      if (state !== "spoken" && state !== "error" && state !== "cancelled") continue;
+      const w = watchers.get(ctx.node.id)?.get(ttsStatusDevice);
+      if (!w?.awaitingTts) continue;
+      clearTimeout(w.awaitingTts.watchdog);
+      w.awaitingTts = null;
+      // Schedule the next quip — utterance_period_ms now measures the
+      // GAP between two spoken lines, not between two send-to-phone
+      // events. Closer to the user-facing rhythm they asked for.
+      if (w.detector.isStill) scheduleUtterance(ctx.node.id, ttsStatusDevice, w, cfg);
+      continue;
+    }
+
+    const deviceId = deviceFromAccelTopic(msg.topic);
     if (!deviceId) continue;
     if (cfg.device_id && deviceId !== cfg.device_id) continue;
 
@@ -428,6 +479,10 @@ export const handler: NodeHandler = (ctx: NodeContext) => {
       scheduleUtterance(ctx.node.id, deviceId, w, cfg, { immediate: true });
     } else {
       if (w.utteranceTimer) { clearTimeout(w.utteranceTimer); w.utteranceTimer = null; }
+      if (w.awaitingTts) {
+        clearTimeout(w.awaitingTts.watchdog);
+        w.awaitingTts = null;
+      }
       publishStatus(ctx.node.id, deviceId, { state: "active", utterances_during_episode: w.count });
       w.count = 0;
     }
