@@ -110,10 +110,13 @@ function cacheSize(nodeId: string, language: string): number {
   return getCache(nodeId).byLang.get(language)?.length ?? 0;
 }
 
-function popQuip(nodeId: string, language: string): string | null {
-  const queue = getCache(nodeId).byLang.get(language);
+function popQuip(nodeId: string, language: string, target: number): string | null {
+  const c = getCache(nodeId);
+  const queue = c.byLang.get(language);
   if (!queue || queue.length === 0) return null;
-  return queue.shift() ?? null;
+  const out = queue.shift() ?? null;
+  publishCacheSnapshot(nodeId, c, target); // UI sees the count drop instantly
+  return out;
 }
 
 /**
@@ -144,12 +147,7 @@ function refillCache(nodeId: string, model: string, language: string, cfg: DevCo
         });
       } finally {
         c.inflight.set(language, Math.max(0, (c.inflight.get(language) ?? 1) - 1));
-        publishStatus(nodeId, "__cache__", {
-          state: "cache.size",
-          language,
-          size: queue.length,
-          inflight: c.inflight.get(language) ?? 0,
-        });
+        publishCacheSnapshot(nodeId, c, cfg.cache_target);
         // Chain — if the queue still isn't full and we have spare slots,
         // spin up another refill round.
         const live = getCurrentConfigForNode(nodeId, cfg);
@@ -161,6 +159,27 @@ function refillCache(nodeId: string, model: string, language: string, cfg: DevCo
 
 function clearCache(nodeId: string): void {
   caches.delete(nodeId);
+}
+
+/** Snapshot of every language's queue + in-flight count, for the UI. */
+function publishCacheSnapshot(nodeId: string, c: NodeCache, target: number): void {
+  const bus = BrainService.current?.bus;
+  if (!bus) return;
+  const langs: Record<string, { quips: string[]; inflight: number }> = {};
+  for (const [lang, queue] of c.byLang) {
+    langs[lang] = {
+      quips: queue.slice(0, 20), // bounded — protect history size
+      inflight: c.inflight.get(lang) ?? 0,
+    };
+  }
+  bus.publish({
+    from: nodeId,
+    topic: "phone-loneliness.cache",
+    type: "text",
+    criticality: 0,
+    payload: { content: JSON.stringify({ target, langs }) },
+    metadata: { target, langs, ts: new Date().toISOString() },
+  });
 }
 
 function deviceFromTopic(topic: string): string | null {
@@ -302,7 +321,7 @@ async function tick(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: Dev
     // tac-au-tac. On miss, fall back to a live LLM call so we never
     // skip a tick (e.g. very first put-down before the spawn pre-warm
     // had time to land).
-    let text = popQuip(nodeId, live.language);
+    let text = popQuip(nodeId, live.language, live.cache_target);
     let source: "cache" | "live" = "cache";
     if (!text) {
       source = "live";

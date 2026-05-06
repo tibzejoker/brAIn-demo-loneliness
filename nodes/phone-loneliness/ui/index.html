@@ -24,7 +24,7 @@
 
     main {
       flex: 1; display: grid; min-height: 0; overflow: hidden;
-      grid-template-columns: 280px 1fr; gap: 1px; background: var(--border);
+      grid-template-columns: 280px 1fr 320px; gap: 1px; background: var(--border);
     }
     .pane { background: var(--bg); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
     .pane h2 {
@@ -65,6 +65,26 @@
     .utt .meta { font-size: 10px; color: var(--muted); margin-bottom: 2px; }
     .utt .text { color: var(--text); font-size: 13px; font-style: italic; }
     .empty { color: var(--muted); font-style: italic; padding: 16px; text-align: center; font-size: 12px; }
+
+    /* — cache panel — */
+    .cache-lang {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
+      margin-bottom: 8px; overflow: hidden;
+    }
+    .cache-lang.current { border-color: var(--accent); }
+    .cache-lang-head {
+      padding: 6px 10px; font-size: 12px; display: flex; align-items: center; gap: 6px;
+      background: var(--panel-2); border-bottom: 1px solid var(--border);
+    }
+    .cache-lang-head .lab { font-weight: 600; }
+    .cache-lang-head .count { margin-left: auto; font: 11px ui-monospace, monospace; color: var(--muted); }
+    .cache-lang-head .cooking { font-size: 10px; color: var(--accent); }
+    .cache-quip {
+      padding: 6px 10px; border-top: 1px dashed var(--border); font-size: 12px;
+      color: var(--text); font-style: italic;
+    }
+    .cache-quip:first-of-type { border-top: 0; }
+    .cache-quip .idx { font: 10px ui-monospace, monospace; color: var(--muted); margin-right: 6px; }
   </style>
 </head>
 <body>
@@ -106,6 +126,13 @@
       <h2>Recent shame</h2>
       <div class="pane-body log" id="log">
         <div class="empty">The phone hasn't complained yet. Yet.</div>
+      </div>
+    </div>
+
+    <div class="pane">
+      <h2>Cache map <span class="hint" style="margin-left: auto;" id="cache-target-hint"></span></h2>
+      <div class="pane-body" id="cache-panel">
+        <div class="empty">Pre-warming…</div>
       </div>
     </div>
   </main>
@@ -201,6 +228,11 @@
     }
 
     function dispatch(msg) {
+      if (msg.topic === 'phone-loneliness.cache') {
+        const meta = msg.metadata || {};
+        renderCacheMap(meta.target ?? 5, meta.langs ?? {});
+        return;
+      }
       if (msg.topic !== 'phone-loneliness.status') return;
       const meta = msg.metadata || {};
       const deviceId = meta.deviceId;
@@ -254,6 +286,55 @@
         const il = cur.inflight > 0 ? ` (+${cur.inflight} cooking)` : '';
         badge.textContent = `cache ${cur.size}${il}`;
       }
+    }
+
+    /** Render the per-language quip map sent on phone-loneliness.cache. */
+    function renderCacheMap(target, langs) {
+      const targetHint = document.getElementById('cache-target-hint');
+      if (targetHint) targetHint.textContent = `target ${target}`;
+      const root = document.getElementById('cache-panel');
+      const entries = Object.entries(langs);
+      if (entries.length === 0) {
+        root.innerHTML = '<div class="empty">Pre-warming…</div>';
+        return;
+      }
+      // Selected language first, then by descending queue depth.
+      entries.sort((a, b) => {
+        if (a[0] === language) return -1;
+        if (b[0] === language) return 1;
+        return (b[1].quips?.length ?? 0) - (a[1].quips?.length ?? 0);
+      });
+      const frag = document.createDocumentFragment();
+      for (const [lang, data] of entries) {
+        const quips = data.quips || [];
+        const inflight = data.inflight || 0;
+        const div = document.createElement('div');
+        div.className = `cache-lang${lang === language ? ' current' : ''}`;
+        const head = document.createElement('div');
+        head.className = 'cache-lang-head';
+        head.innerHTML = `
+          <span class="lab">${escapeHtml(lang)}</span>
+          ${inflight > 0 ? `<span class="cooking">${inflight} cooking</span>` : ''}
+          <span class="count">${quips.length} / ${target}</span>
+        `;
+        div.appendChild(head);
+        if (quips.length === 0) {
+          const empty = document.createElement('div');
+          empty.className = 'cache-quip';
+          empty.style.color = 'var(--muted)';
+          empty.textContent = inflight > 0 ? '…cooking' : 'empty';
+          div.appendChild(empty);
+        } else {
+          quips.forEach((q, i) => {
+            const item = document.createElement('div');
+            item.className = 'cache-quip';
+            item.innerHTML = `<span class="idx">${i + 1}</span>${escapeHtml(q)}`;
+            div.appendChild(item);
+          });
+        }
+        frag.appendChild(div);
+      }
+      root.replaceChildren(frag);
     }
 
     function appendLog(deviceId, text, lang, ts, klass = '') {

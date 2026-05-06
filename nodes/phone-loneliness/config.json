@@ -21,6 +21,7 @@
   ],
   "default_publishes": [
     "phone-loneliness.status",
+    "phone-loneliness.cache",
     "mobile.*.tts.speak"
   ],
   "has_ui": true,
