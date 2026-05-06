@@ -38,7 +38,7 @@ It listens to `mobile.*.sensor.accel` (any [brAIn-mobile](https://github.com/tib
 
 | Key | Default | What it does |
 |---|---|---|
-| `model` | `ollama/gemma2:2b` | LLM used to generate quips. Any model the brAIn LLM registry knows. |
+| `model` | `ollama/gemma4:e4b` | LLM used to generate quips. Any model the brAIn LLM registry knows. Defaults to the same model the brain consciousness uses, so a typical brAIn checkout already has it pulled. |
 | `language` | `en-US` | BCP-47 voice / locale forwarded to the mobile TTS. The node UI has a dropdown that hot-swaps it via `PATCH /nodes/:id/config`. |
 | `device_id` | `null` | Scope to one phone (its UUID). Default `null` = nag every connected phone. |
 | `max_range` | `0.5` | m/s² range tolerated per axis across the window before "still" is rejected. ≈ 5% of g. |
@@ -73,7 +73,7 @@ Then `pnpm install` from `brAIn/`, `pnpm --filter @brain/node-phone-loneliness b
 
 ## Try it
 
-1. Start brAIn (`pnpm start`), spawn `brain` (consciousness) and any LLM provider (`ollama` is enough — `ollama serve` + `ollama pull gemma2:2b`).
+1. Start brAIn (`pnpm start`), spawn `brain` (consciousness) and any LLM provider (`ollama` is enough — `ollama serve` + `ollama pull gemma4:e4b` if you don't already have it).
 2. Open the dashboard's **Distributed** pane, toggle **Open to LAN**, scan the QR with brAIn-mobile.
 3. From the dashboard's **Spawn** dialog, pick `phone-loneliness`. Open its UI iframe.
 4. Put the phone on a table.

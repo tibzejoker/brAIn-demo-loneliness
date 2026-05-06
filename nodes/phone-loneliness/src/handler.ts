@@ -43,7 +43,7 @@ const watchers = new Map<string, Map<string, DeviceWatcher>>(); // nodeId → de
 
 function getConfig(overrides: Record<string, unknown> = {}): DevConfig {
   return {
-    model: (overrides.model as string | undefined) ?? "ollama/gemma2:2b",
+    model: (overrides.model as string | undefined) ?? "ollama/gemma4:e4b",
     language: (overrides.language as string | undefined) ?? "en-US",
     device_id: (overrides.device_id as string | undefined) ?? null,
     max_range: (overrides.max_range as number | undefined) ?? 0.5,
