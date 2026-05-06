@@ -62,6 +62,9 @@
       padding: 8px 10px; margin-bottom: 6px; background: var(--panel-2);
       border-left: 3px solid var(--accent); border-radius: 4px;
     }
+    .utt.pickup { border-left-color: var(--ok); background: rgba(34,197,94,0.07); }
+    .utt.pickup .meta::before { content: '✋ pickup · '; color: var(--ok); }
+    .utt.error { border-left-color: var(--error); background: rgba(239,68,68,0.07); }
     .utt .meta { font-size: 10px; color: var(--muted); margin-bottom: 2px; }
     .utt .text { color: var(--text); font-size: 13px; font-style: italic; }
     .empty { color: var(--muted); font-style: italic; padding: 16px; text-align: center; font-size: 12px; }
@@ -230,7 +233,7 @@
     function dispatch(msg) {
       if (msg.topic === 'phone-loneliness.cache') {
         const meta = msg.metadata || {};
-        renderCacheMap(meta.target ?? 5, meta.langs ?? {});
+        renderCacheMap(meta.target ?? 5, meta.langs ?? {}, meta.pickup_target ?? 3, meta.pickup ?? {});
         return;
       }
       if (msg.topic !== 'phone-loneliness.status') return;
@@ -240,6 +243,12 @@
       // Cache pseudo-device — surfaced separately, not in the device list.
       if (deviceId.startsWith('__')) {
         if (meta.state === 'cache.size') updateCacheBadge(meta.language, meta.size, meta.inflight);
+        return;
+      }
+      // Pickup is a one-shot event, not a persistent state — log it but
+      // don't pin the device's badge to "pickup".
+      if (meta.state === 'pickup' && typeof meta.text === 'string') {
+        appendLog(deviceId, meta.text, meta.language ?? 'en-US', msg.timestamp, 'pickup');
         return;
       }
       const cur = devices.get(deviceId) ?? { state: 'unknown', count: 0, language: 'en-US' };
@@ -288,53 +297,68 @@
       }
     }
 
-    /** Render the per-language quip map sent on phone-loneliness.cache. */
-    function renderCacheMap(target, langs) {
+    /** Render the per-language quip map. Two sub-sections per language:
+     *  the still-episode quips and the pickup-line cache. */
+    function renderCacheMap(target, langs, pickupTarget, pickup) {
       const targetHint = document.getElementById('cache-target-hint');
-      if (targetHint) targetHint.textContent = `target ${target}`;
+      if (targetHint) targetHint.textContent = `still ${target} · pickup ${pickupTarget}`;
       const root = document.getElementById('cache-panel');
-      const entries = Object.entries(langs);
-      if (entries.length === 0) {
+      const allLangs = new Set([...Object.keys(langs), ...Object.keys(pickup)]);
+      if (allLangs.size === 0) {
         root.innerHTML = '<div class="empty">Pre-warming…</div>';
         return;
       }
-      // Selected language first, then by descending queue depth.
-      entries.sort((a, b) => {
-        if (a[0] === language) return -1;
-        if (b[0] === language) return 1;
-        return (b[1].quips?.length ?? 0) - (a[1].quips?.length ?? 0);
+      // Selected language first, then by descending main queue depth.
+      const entries = [...allLangs].sort((a, b) => {
+        if (a === language) return -1;
+        if (b === language) return 1;
+        return (langs[b]?.quips?.length ?? 0) - (langs[a]?.quips?.length ?? 0);
       });
       const frag = document.createDocumentFragment();
-      for (const [lang, data] of entries) {
-        const quips = data.quips || [];
-        const inflight = data.inflight || 0;
+      for (const lang of entries) {
+        const stillData = langs[lang] ?? { quips: [], inflight: 0 };
+        const pickData = pickup[lang] ?? { quips: [], inflight: 0 };
         const div = document.createElement('div');
         div.className = `cache-lang${lang === language ? ' current' : ''}`;
         const head = document.createElement('div');
         head.className = 'cache-lang-head';
-        head.innerHTML = `
-          <span class="lab">${escapeHtml(lang)}</span>
-          ${inflight > 0 ? `<span class="cooking">${inflight} cooking</span>` : ''}
-          <span class="count">${quips.length} / ${target}</span>
-        `;
+        head.innerHTML = `<span class="lab">${escapeHtml(lang)}</span>`;
         div.appendChild(head);
-        if (quips.length === 0) {
-          const empty = document.createElement('div');
-          empty.className = 'cache-quip';
-          empty.style.color = 'var(--muted)';
-          empty.textContent = inflight > 0 ? '…cooking' : 'empty';
-          div.appendChild(empty);
-        } else {
-          quips.forEach((q, i) => {
-            const item = document.createElement('div');
-            item.className = 'cache-quip';
-            item.innerHTML = `<span class="idx">${i + 1}</span>${escapeHtml(q)}`;
-            div.appendChild(item);
-          });
-        }
+        div.appendChild(renderCacheSubsection('still episode', stillData.quips || [], stillData.inflight || 0, target, 'accent'));
+        div.appendChild(renderCacheSubsection('pickup line', pickData.quips || [], pickData.inflight || 0, pickupTarget, 'ok'));
         frag.appendChild(div);
       }
       root.replaceChildren(frag);
+    }
+
+    function renderCacheSubsection(label, quips, inflight, target, accent) {
+      const wrap = document.createElement('div');
+      wrap.style.borderTop = '1px solid var(--border)';
+      const sub = document.createElement('div');
+      sub.className = 'cache-lang-head';
+      sub.style.background = 'transparent';
+      sub.style.borderBottom = '0';
+      sub.innerHTML = `
+        <span style="font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:var(--${accent});">${label}</span>
+        ${inflight > 0 ? `<span class="cooking">${inflight} cooking</span>` : ''}
+        <span class="count">${quips.length} / ${target}</span>
+      `;
+      wrap.appendChild(sub);
+      if (quips.length === 0) {
+        const e = document.createElement('div');
+        e.className = 'cache-quip';
+        e.style.color = 'var(--muted)';
+        e.textContent = inflight > 0 ? '…cooking' : 'empty';
+        wrap.appendChild(e);
+      } else {
+        quips.forEach((q, i) => {
+          const item = document.createElement('div');
+          item.className = 'cache-quip';
+          item.innerHTML = `<span class="idx">${i + 1}</span>${escapeHtml(q)}`;
+          wrap.appendChild(item);
+        });
+      }
+      return wrap;
     }
 
     function appendLog(deviceId, text, lang, ts, klass = '') {

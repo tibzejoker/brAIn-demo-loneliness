@@ -191,24 +191,34 @@ function clearCache(nodeId: string): void {
   caches.delete(nodeId);
 }
 
-/** Snapshot of every language's queue + in-flight count, for the UI. */
+/** Snapshot of every language's queue + in-flight count, for the UI.
+ *  Includes both the main (still-episode) cache and the pickup cache
+ *  so the UI can render two side-by-side panes. */
 function publishCacheSnapshot(nodeId: string, c: NodeCache, target: number): void {
   const bus = BrainService.current?.bus;
   if (!bus) return;
   const langs: Record<string, { quips: string[]; inflight: number }> = {};
   for (const [lang, queue] of c.byLang) {
     langs[lang] = {
-      quips: queue.slice(0, 20), // bounded — protect history size
+      quips: queue.slice(0, 20),
       inflight: c.inflight.get(lang) ?? 0,
     };
+  }
+  const pickup: Record<string, { quips: string[]; inflight: number }> = {};
+  const perNode = pickupCache.get(nodeId);
+  if (perNode) {
+    for (const [lang, queue] of perNode) {
+      const inflight = PICKUP_INFLIGHT.get(`${nodeId}|${lang}`)?.size ?? 0;
+      pickup[lang] = { quips: queue.slice(0, 10), inflight };
+    }
   }
   bus.publish({
     from: nodeId,
     topic: "phone-loneliness.cache",
     type: "text",
     criticality: 0,
-    payload: { content: JSON.stringify({ target, langs }) },
-    metadata: { target, langs, ts: new Date().toISOString() },
+    payload: { content: JSON.stringify({ target, pickup_target: PICKUP_CACHE_TARGET, langs, pickup }) },
+    metadata: { target, pickup_target: PICKUP_CACHE_TARGET, langs, pickup, ts: new Date().toISOString() },
   });
 }
 
@@ -354,7 +364,12 @@ function getPickupQueue(nodeId: string, language: string): string[] {
 
 function popPickup(nodeId: string, language: string): string | null {
   const q = getPickupQueue(nodeId, language);
-  return q.shift() ?? null;
+  const out = q.shift() ?? null;
+  // Push a fresh cache snapshot so the UI sees the queue shrink instantly.
+  const c = caches.get(nodeId);
+  const cfg = getCurrentConfigForNode(nodeId, getConfig({}));
+  if (c) publishCacheSnapshot(nodeId, c, cfg.cache_target);
+  return out;
 }
 
 function clearPickupCache(nodeId: string): void {
@@ -417,7 +432,14 @@ function refillPickupCache(nodeId: string, model: string, language: string): voi
         const text = await generatePickup(model, language, new AbortController().signal);
         if (text) q.push(text);
       } catch (_err) { /* swallow — pickup is best-effort */ }
-      finally { inflight!.delete(id); }
+      finally {
+        inflight!.delete(id);
+        const c = caches.get(nodeId);
+        if (c) {
+          const cfg = getCurrentConfigForNode(nodeId, getConfig({}));
+          publishCacheSnapshot(nodeId, c, cfg.cache_target);
+        }
+      }
     })();
   }
 }
