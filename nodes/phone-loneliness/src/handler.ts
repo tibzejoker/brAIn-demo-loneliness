@@ -17,6 +17,8 @@ interface DeviceWatcher {
    * publishes. The watchdog frees us if the phone never reports back.
    */
   awaitingTts: { sentAt: number; watchdog: NodeJS.Timeout } | null;
+  /** Active flash-dance schedule (random on/off blinks while speaking). */
+  flashDance: { timer: NodeJS.Timeout | null; on: boolean } | null;
 }
 
 interface DevConfig {
@@ -55,9 +57,12 @@ function languageLabel(bcp47: string): string {
   return LANGUAGE_NAMES[bcp47] ?? LANGUAGE_NAMES[bcp47.split("-")[0]] ?? bcp47;
 }
 
-function buildSystemPrompt(language: string): string {
+function buildSystemPrompt(language: string, recent: string[] = []): string {
   const label = languageLabel(language);
-  return `You are the inner voice of a phone that has just been PUT DOWN by its human — set on a table, dropped on the couch, left face-down somewhere — and feels physically abandoned.
+  const avoid = recent.length > 0
+    ? `\n\nAlready said in the last few turns — do NOT repeat the same idea, do NOT pick the same angle, do NOT rephrase these:\n${recent.map((q) => `- ${q}`).join("\n")}\n`
+    : "";
+  return `${avoid}You are the inner voice of a phone that has just been PUT DOWN by its human — set on a table, dropped on the couch, left face-down somewhere — and feels physically abandoned.
 
 The theme is BEING IGNORED / NEGLECTED / LEFT BEHIND. NOT silence. NOT quietness.
 Avoid every variant of the word "silence" / "silent" / "quiet" / "stillness" — the joke is about ABANDONMENT, not sound.
@@ -159,8 +164,11 @@ function refillCache(nodeId: string, model: string, language: string, cfg: DevCo
   for (let i = 0; i < toLaunch; i++) {
     void (async (): Promise<void> => {
       try {
-        const text = await generateUtterance(model, language, new AbortController().signal);
-        if (text && c.byLang.get(language) === queue) queue.push(text);
+        const text = await generateUtterance(model, language, getRecentQuips(nodeId, language), new AbortController().signal);
+        if (text && c.byLang.get(language) === queue) {
+          queue.push(text);
+          rememberQuip(nodeId, language, text);
+        }
       } catch (err) {
         publishStatus(nodeId, "__cache__", {
           state: "cache.error",
@@ -256,16 +264,92 @@ function publishTtsSpeak(nodeId: string, deviceId: string, text: string, voice: 
   });
 }
 
-async function generateUtterance(model: string, language: string, signal: AbortSignal): Promise<string> {
+/** Send `mobile.<deviceId>.flash {on}` — the brAIn-mobile FlashService
+ *  honours the `on` boolean directly. */
+function publishFlash(nodeId: string, deviceId: string, on: boolean): void {
+  const bus = BrainService.current?.bus;
+  if (!bus) return;
+  const meta = { on };
+  bus.publish({
+    from: nodeId,
+    topic: `mobile.${deviceId}.flash`,
+    type: "text",
+    criticality: 2,
+    payload: { content: JSON.stringify(meta) },
+    metadata: meta,
+  });
+}
+
+/** Erratic on/off cadence while the phone speaks — picked up + spoken
+ *  events both call stopFlashDance which guarantees a final {on: false}. */
+function startFlashDance(nodeId: string, deviceId: string, w: DeviceWatcher): void {
+  stopFlashDance(nodeId, deviceId, w);
+  w.flashDance = { timer: null, on: false };
+  const step = (): void => {
+    if (!w.flashDance) return;
+    w.flashDance.on = !w.flashDance.on;
+    publishFlash(nodeId, deviceId, w.flashDance.on);
+    // Random dwell — short blinks (40-180 ms) when on, longer dark
+    // pauses (60-360 ms) when off. Feels alive without strobing.
+    const min = w.flashDance.on ? 40 : 60;
+    const max = w.flashDance.on ? 180 : 360;
+    const delay = Math.floor(Math.random() * (max - min + 1)) + min;
+    w.flashDance.timer = setTimeout(step, delay);
+  };
+  step();
+}
+
+function stopFlashDance(nodeId: string, deviceId: string, w: DeviceWatcher): void {
+  if (!w.flashDance) return;
+  if (w.flashDance.timer) clearTimeout(w.flashDance.timer);
+  const wasOn = w.flashDance.on;
+  w.flashDance = null;
+  // Always publish a final OFF, even if the last toggle already set it
+  // off — guarantees the torch is dark when speaking ends or the user
+  // picks the phone back up. Cheap idempotent message on the bus.
+  if (wasOn) publishFlash(nodeId, deviceId, false);
+  else publishFlash(nodeId, deviceId, false); // belt + suspenders
+}
+
+// ── Anti-repetition memory ────────────────────────────────────────────
+// Keep the last N quips per (node, language) so the prompt can ask the
+// model to vary its angle. Otherwise gemma4 anchors on "cold table" /
+// "sticky coaster" and produces the same idea over and over.
+const recentQuips = new Map<string, Map<string, string[]>>();
+const RECENT_QUIPS_CAP = 10;
+
+function rememberQuip(nodeId: string, language: string, text: string): void {
+  let perNode = recentQuips.get(nodeId);
+  if (!perNode) { perNode = new Map(); recentQuips.set(nodeId, perNode); }
+  let queue = perNode.get(language);
+  if (!queue) { queue = []; perNode.set(language, queue); }
+  queue.push(text);
+  while (queue.length > RECENT_QUIPS_CAP) queue.shift();
+}
+
+function getRecentQuips(nodeId: string, language: string): string[] {
+  return recentQuips.get(nodeId)?.get(language) ?? [];
+}
+
+function clearRecentQuips(nodeId: string): void {
+  recentQuips.delete(nodeId);
+}
+
+async function generateUtterance(
+  model: string,
+  language: string,
+  recent: string[],
+  signal: AbortSignal,
+): Promise<string> {
   const registry = LLMRegistry.getInstance();
   const m = registry.getModel(model);
   const label = languageLabel(language);
   const result = await generateText({
     model: m,
-    system: buildSystemPrompt(language),
+    system: buildSystemPrompt(language, recent),
     messages: [{
       role: "user",
-      content: `Speak. One short passive-aggressive sentence in ${label} about being put down. No reasoning, no preamble, just the line.`,
+      content: `Speak. One short passive-aggressive sentence in ${label} about being put down. Pick a fresh angle from the menu — DO NOT recycle ideas already used. No reasoning, no preamble, just the line.`,
     }],
     maxOutputTokens: 200,
     abortSignal: signal,
@@ -304,6 +388,7 @@ function getOrCreateWatcher(nodeId: string, deviceId: string, cfg: DevConfig): D
       count: 0,
       announced: false,
       awaitingTts: null,
+      flashDance: null,
     };
     perNode.set(deviceId, w);
   }
@@ -313,9 +398,15 @@ function getOrCreateWatcher(nodeId: string, deviceId: string, cfg: DevConfig): D
 function clearAllWatchers(nodeId: string): void {
   const perNode = watchers.get(nodeId);
   if (!perNode) return;
-  for (const w of perNode.values()) {
+  for (const [deviceId, w] of perNode) {
     if (w.utteranceTimer) { clearTimeout(w.utteranceTimer); w.utteranceTimer = null; }
     if (w.awaitingTts) { clearTimeout(w.awaitingTts.watchdog); w.awaitingTts = null; }
+    if (w.flashDance?.timer) clearTimeout(w.flashDance.timer);
+    if (w.flashDance) {
+      // Final off so we don't leave the torch lit on teardown.
+      publishFlash(nodeId, deviceId, false);
+      w.flashDance = null;
+    }
   }
   watchers.delete(nodeId);
 }
@@ -357,16 +448,19 @@ async function tick(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: Dev
     if (!text) {
       source = "live";
       const ac = new AbortController();
-      text = await generateUtterance(live.model, live.language, ac.signal);
+      text = await generateUtterance(live.model, live.language, getRecentQuips(nodeId, live.language), ac.signal);
     }
 
     if (text) {
+      rememberQuip(nodeId, live.language, text);
       w.count += 1;
       publishStatus(nodeId, deviceId, {
         state: "uttered", text, count: w.count, language: live.language, source,
         cache_size: cacheSize(nodeId, live.language),
       });
       publishTtsSpeak(nodeId, deviceId, text, live.language);
+      // Flashlight strobe while the phone speaks.
+      startFlashDance(nodeId, deviceId, w);
       // Wait for the phone to confirm it finished speaking before
       // counting down utterance_period_ms — the spoken-event handler
       // re-schedules tick(). Watchdog frees us if the device drops
@@ -432,13 +526,17 @@ export const onSpawn: NodeOnSpawn = (info: NodeInfo) => {
 export const teardown: NodeTeardown = (info: NodeInfo) => {
   clearAllWatchers(info.id);
   clearCache(info.id);
+  clearRecentQuips(info.id);
 };
 
 export const handler: NodeHandler = (ctx: NodeContext) => {
-  if (ctx.messages.length === 0) {
-    ctx.sleep([{ type: "any" }]);
-    return Promise.resolve();
-  }
+  // Intentionally NO ctx.sleep — accel samples flow at 10 Hz, and an
+  // every-batch sleep flips the runner state into "sleeping" between
+  // each call which makes the dashboard node icon strobe. The runner's
+  // default behaviour (no sleep call) keeps the node visually steady;
+  // it still won't burn CPU because we only get re-invoked when new
+  // messages land in our mailbox.
+  if (ctx.messages.length === 0) return Promise.resolve();
 
   const cfg = getConfig(ctx.node.config_overrides ?? {});
 
@@ -451,7 +549,12 @@ export const handler: NodeHandler = (ctx: NodeContext) => {
       const state = meta?.state ?? "";
       if (state !== "spoken" && state !== "error" && state !== "cancelled") continue;
       const w = watchers.get(ctx.node.id)?.get(ttsStatusDevice);
-      if (!w?.awaitingTts) continue;
+      if (!w) continue;
+      // Always cut the flash dance when the phone reports a tts terminal
+      // state — even if we're not awaiting (defensive against duplicate
+      // events from the mobile app).
+      stopFlashDance(ctx.node.id, ttsStatusDevice, w);
+      if (!w.awaitingTts) continue;
       clearTimeout(w.awaitingTts.watchdog);
       w.awaitingTts = null;
       // Schedule the next quip — utterance_period_ms now measures the
@@ -497,6 +600,9 @@ export const handler: NodeHandler = (ctx: NodeContext) => {
         clearTimeout(w.awaitingTts.watchdog);
         w.awaitingTts = null;
       }
+      // User picked the phone back up — kill the flash strobe so the
+      // torch isn't left on in a random state.
+      stopFlashDance(ctx.node.id, deviceId, w);
       publishStatus(ctx.node.id, deviceId, { state: "active", utterances_during_episode: w.count });
       w.count = 0;
     }
