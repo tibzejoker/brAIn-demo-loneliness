@@ -627,6 +627,13 @@ function getCurrentConfigForNode(nodeId: string, fallback: DevConfig): DevConfig
   return getConfig(node.config_overrides ?? {});
 }
 
+// nodeId → setInterval handle keeping the cache warm regardless of
+// whether a phone is feeding us accel samples. The handler also calls
+// refillCache on every accel tick (instant catch-up), but without that
+// trigger the cache for a freshly-picked language sits empty forever.
+const prewarmTimers = new Map<string, NodeJS.Timeout>();
+const PREWARM_INTERVAL_MS = 2000;
+
 export const onSpawn: NodeOnSpawn = (info: NodeInfo) => {
   // Ensure the watcher map slot exists and is empty for this instance.
   watchers.set(info.id, new Map());
@@ -635,9 +642,20 @@ export const onSpawn: NodeOnSpawn = (info: NodeInfo) => {
   const cfg = getConfig(info.config_overrides ?? {});
   refillCache(info.id, cfg.model, cfg.language, cfg);
   refillPickupCache(info.id, cfg.model, cfg.language);
+  // Keep the cache warm even with no phone connected — picks up the
+  // current `language` override on each tick so dropdown changes
+  // populate the new language within a couple of seconds.
+  const timer = setInterval(() => {
+    const live = getCurrentConfigForNode(info.id, cfg);
+    refillCache(info.id, live.model, live.language, live);
+    refillPickupCache(info.id, live.model, live.language);
+  }, PREWARM_INTERVAL_MS);
+  prewarmTimers.set(info.id, timer);
 };
 
 export const teardown: NodeTeardown = (info: NodeInfo) => {
+  const timer = prewarmTimers.get(info.id);
+  if (timer) { clearInterval(timer); prewarmTimers.delete(info.id); }
   clearAllWatchers(info.id);
   clearCache(info.id);
   clearRecentQuips(info.id);
