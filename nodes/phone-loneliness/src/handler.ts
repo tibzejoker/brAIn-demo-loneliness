@@ -643,12 +643,8 @@ export const teardown: NodeTeardown = (info: NodeInfo) => {
 };
 
 export const handler: NodeHandler = (ctx: NodeContext) => {
-  // Intentionally NO ctx.sleep — accel samples flow at 10 Hz, and an
-  // every-batch sleep flips the runner state into "sleeping" between
-  // each call which makes the dashboard node icon strobe. The runner's
-  // default behaviour (no sleep call) keeps the node visually steady;
-  // it still won't burn CPU because we only get re-invoked when new
-  // messages land in our mailbox.
+  // The framework re-invokes us only when new accel samples land in
+  // our mailbox, so we don't burn CPU between bursts.
   // Stash the LLM facade so background cache-refill tasks (which span
   // many handler iterations) can keep hitting the model after this
   // particular `ctx` has expired. The facade's other deps are process-
