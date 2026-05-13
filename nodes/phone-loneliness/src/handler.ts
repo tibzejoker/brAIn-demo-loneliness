@@ -1,6 +1,13 @@
-import type { NodeContext, NodeHandler, NodeOnSpawn, NodeTeardown, NodeInfo, TextPayload, Message } from "@brain/sdk";
-import { BrainService, LLMRegistry, generateText } from "@brain/core";
+import type { NodeContext, NodeHandler, NodeOnSpawn, NodeTeardown, NodeInfo, TextPayload, Message, LLMFacade } from "@brain/sdk";
+import { BrainService } from "@brain/core";
 import { StillnessDetector, type AccelSample } from "./stillness";
+
+// Cache the LLMFacade per-node so background cache-refill tasks can
+// reach it from outside a handler iteration. The facade's internal
+// `deps.signal` is iteration-bound, but everything else (the registry,
+// the config store, the bus) is process-wide — and we always pass a
+// fresh `signal:` per call to override the stale one.
+const facades = new Map<string, LLMFacade>();
 
 interface DeviceWatcher {
   detector: StillnessDetector;
@@ -22,7 +29,6 @@ interface DeviceWatcher {
 }
 
 interface DevConfig {
-  model: string;
   language: string;
   device_id: string | null;
   /** Accel range (m/s²) tolerated per axis across the window. */
@@ -99,7 +105,6 @@ const watchers = new Map<string, Map<string, DeviceWatcher>>(); // nodeId → de
 
 function getConfig(overrides: Record<string, unknown> = {}): DevConfig {
   return {
-    model: (overrides.model as string | undefined) ?? "ollama/gemma4:e4b",
     language: (overrides.language as string | undefined) ?? "en-US",
     device_id: (overrides.device_id as string | undefined) ?? null,
     max_range: (overrides.max_range as number | undefined) ?? 0.2,
@@ -151,7 +156,9 @@ function popQuip(nodeId: string, language: string, target: number): string | nul
  * `cache_max_inflight` LLM calls in parallel. Idempotent — concurrent
  * callers see the same in-flight counter and don't over-shoot.
  */
-function refillCache(nodeId: string, model: string, language: string, cfg: DevConfig): void {
+function refillCache(nodeId: string, language: string, cfg: DevConfig): void {
+  const llm = facades.get(nodeId);
+  if (!llm) return; // no facade cached yet — handler hasn't fired
   const c = getCache(nodeId);
   let queue = c.byLang.get(language);
   if (!queue) { queue = []; c.byLang.set(language, queue); }
@@ -164,7 +171,7 @@ function refillCache(nodeId: string, model: string, language: string, cfg: DevCo
   for (let i = 0; i < toLaunch; i++) {
     void (async (): Promise<void> => {
       try {
-        const text = await generateUtterance(model, language, getRecentQuips(nodeId, language), new AbortController().signal);
+        const text = await generateUtterance(llm, language, getRecentQuips(nodeId, language), new AbortController().signal);
         if (text && c.byLang.get(language) === queue) {
           queue.push(text);
           rememberQuip(nodeId, language, text);
@@ -181,7 +188,7 @@ function refillCache(nodeId: string, model: string, language: string, cfg: DevCo
         // Chain — if the queue still isn't full and we have spare slots,
         // spin up another refill round.
         const live = getCurrentConfigForNode(nodeId, cfg);
-        if (live.language === language) refillCache(nodeId, live.model, language, live);
+        if (live.language === language) refillCache(nodeId, language, live);
       }
     })();
   }
@@ -395,31 +402,21 @@ Max 18 words. No quotes, no narration, no emoji, no chain-of-thought.
 Output the sentence only.`;
 }
 
-async function generatePickup(model: string, language: string, signal: AbortSignal): Promise<string> {
-  const registry = LLMRegistry.getInstance();
-  const m = registry.getModel(model);
+async function generatePickup(llm: LLMFacade, language: string, signal: AbortSignal): Promise<string> {
   const label = languageLabel(language);
-  const result = await generateText({
-    model: m,
+  const text = await llm.text({
     system: pickupSystemPrompt(language),
-    messages: [{ role: "user", content: `Speak. One short sentence in ${label} reacting to being picked back up. No reasoning, just the line.` }],
-    maxOutputTokens: 200,
-    abortSignal: signal,
+    prompt: `Speak. One short sentence in ${label} reacting to being picked back up. No reasoning, just the line.`,
+    maxTokens: 200,
+    signal,
   });
-  const r = result as unknown as Record<string, unknown>;
-  let text = "";
-  if (typeof result.text === "string" && result.text) text = result.text;
-  if (!text && Array.isArray(r.steps) && r.steps.length > 0) {
-    const step = r.steps[0] as Record<string, unknown>;
-    if (typeof step.text === "string" && step.text) text = step.text;
-    if (!text && typeof step.reasoning === "string") text = step.reasoning;
-  }
-  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
   const firstLine = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)[0] ?? "";
   return firstLine.replace(/^["'`](.+?)["'`]$/s, "$1").trim();
 }
 
-function refillPickupCache(nodeId: string, model: string, language: string): void {
+function refillPickupCache(nodeId: string, language: string): void {
+  const llm = facades.get(nodeId);
+  if (!llm) return;
   const q = getPickupQueue(nodeId, language);
   const key = `${nodeId}|${language}`;
   let inflight = PICKUP_INFLIGHT.get(key);
@@ -429,7 +426,7 @@ function refillPickupCache(nodeId: string, model: string, language: string): voi
     inflight.add(id);
     void (async (): Promise<void> => {
       try {
-        const text = await generatePickup(model, language, new AbortController().signal);
+        const text = await generatePickup(llm, language, new AbortController().signal);
         if (text) q.push(text);
       } catch (_err) { /* swallow — pickup is best-effort */ }
       finally {
@@ -450,41 +447,20 @@ function publishPickup(nodeId: string, deviceId: string, text: string, voice: st
 }
 
 async function generateUtterance(
-  model: string,
+  llm: LLMFacade,
   language: string,
   recent: string[],
   signal: AbortSignal,
 ): Promise<string> {
-  const registry = LLMRegistry.getInstance();
-  const m = registry.getModel(model);
   const label = languageLabel(language);
-  const result = await generateText({
-    model: m,
+  // ctx.llm.text handles model resolution + reasoning-tag stripping +
+  // failover across the chain. We just declare what we want.
+  const text = await llm.text({
     system: buildSystemPrompt(language, recent),
-    messages: [{
-      role: "user",
-      content: `Speak. One short passive-aggressive sentence in ${label} about being put down. Pick a fresh angle from the menu — DO NOT recycle ideas already used. No reasoning, no preamble, just the line.`,
-    }],
-    maxOutputTokens: 200,
-    abortSignal: signal,
+    prompt: `Speak. One short passive-aggressive sentence in ${label} about being put down. Pick a fresh angle from the menu — DO NOT recycle ideas already used. No reasoning, no preamble, just the line.`,
+    maxTokens: 200,
+    signal,
   });
-  const r = result as unknown as Record<string, unknown>;
-  let text = "";
-  // Mirror @brain/node-brain's extraction: text → steps[0].text → reasoning.
-  // Some thinking-by-default models (gemma4 et al.) dump everything into
-  // a `reasoning` field and leave `text` empty, which used to look to us
-  // like "the model returned nothing".
-  if (typeof result.text === "string" && result.text) text = result.text;
-  if (!text && Array.isArray(r.steps) && r.steps.length > 0) {
-    const step = r.steps[0] as Record<string, unknown>;
-    if (typeof step.text === "string" && step.text) text = step.text;
-    if (!text && typeof step.reasoning === "string") text = step.reasoning;
-  }
-  if (!text && typeof r.reasoning === "string") text = r.reasoning;
-
-  // Some thinking models still emit <think>...</think> wrappers despite
-  // the /no_think hint. Strip them, plus surrounding quotes if any.
-  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
   // Take only the first non-empty line — the prompt asks for one sentence.
   const firstLine = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)[0] ?? "";
   return firstLine.replace(/^["'`](.+?)["'`]$/s, "$1").trim();
@@ -561,8 +537,11 @@ async function tick(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: Dev
     let source: "cache" | "live" = "cache";
     if (!text) {
       source = "live";
-      const ac = new AbortController();
-      text = await generateUtterance(live.model, live.language, getRecentQuips(nodeId, live.language), ac.signal);
+      const llm = facades.get(nodeId);
+      if (llm) {
+        const ac = new AbortController();
+        text = await generateUtterance(llm, live.language, getRecentQuips(nodeId, live.language), ac.signal);
+      }
     }
 
     if (text) {
@@ -591,7 +570,7 @@ async function tick(nodeId: string, deviceId: string, w: DeviceWatcher, cfg: Dev
       armedTtsWait = true;
       // Refill in parallel with the TTS hitting the phone — by the time
       // the user hears this quip, the next one is already cooking.
-      refillCache(nodeId, live.model, live.language, live);
+      refillCache(nodeId, live.language, live);
     } else {
       publishStatus(nodeId, deviceId, { state: "error", error: "model returned empty output" });
     }
@@ -640,15 +619,15 @@ export const onSpawn: NodeOnSpawn = (info: NodeInfo) => {
   // Pre-warm both caches for the configured language so the first
   // put-down AND the first pickup-line have zero LLM latency.
   const cfg = getConfig(info.config_overrides ?? {});
-  refillCache(info.id, cfg.model, cfg.language, cfg);
-  refillPickupCache(info.id, cfg.model, cfg.language);
+  refillCache(info.id, cfg.language, cfg);
+  refillPickupCache(info.id, cfg.language);
   // Keep the cache warm even with no phone connected — picks up the
   // current `language` override on each tick so dropdown changes
   // populate the new language within a couple of seconds.
   const timer = setInterval(() => {
     const live = getCurrentConfigForNode(info.id, cfg);
-    refillCache(info.id, live.model, live.language, live);
-    refillPickupCache(info.id, live.model, live.language);
+    refillCache(info.id, live.language, live);
+    refillPickupCache(info.id, live.language);
   }, PREWARM_INTERVAL_MS);
   prewarmTimers.set(info.id, timer);
 };
@@ -660,6 +639,7 @@ export const teardown: NodeTeardown = (info: NodeInfo) => {
   clearCache(info.id);
   clearRecentQuips(info.id);
   clearPickupCache(info.id);
+  facades.delete(info.id);
 };
 
 export const handler: NodeHandler = (ctx: NodeContext) => {
@@ -669,6 +649,13 @@ export const handler: NodeHandler = (ctx: NodeContext) => {
   // default behaviour (no sleep call) keeps the node visually steady;
   // it still won't burn CPU because we only get re-invoked when new
   // messages land in our mailbox.
+  // Stash the LLM facade so background cache-refill tasks (which span
+  // many handler iterations) can keep hitting the model after this
+  // particular `ctx` has expired. The facade's other deps are process-
+  // wide singletons; the only stale field is `signal`, which we override
+  // per call with our own AbortController inside the helpers.
+  facades.set(ctx.node.id, ctx.llm);
+
   if (ctx.messages.length === 0) return Promise.resolve();
 
   const cfg = getConfig(ctx.node.config_overrides ?? {});
@@ -708,8 +695,8 @@ export const handler: NodeHandler = (ctx: NodeContext) => {
     // bail immediately when at target / capped, so calling them on
     // every accel sample is cheap and gives instant catch-up when the
     // user toggles the language dropdown.
-    refillCache(ctx.node.id, cfg.model, cfg.language, cfg);
-    refillPickupCache(ctx.node.id, cfg.model, cfg.language);
+    refillCache(ctx.node.id, cfg.language, cfg);
+    refillPickupCache(ctx.node.id, cfg.language);
 
     const w = getOrCreateWatcher(ctx.node.id, deviceId, cfg);
     if (!w.announced) {
@@ -747,7 +734,7 @@ export const handler: NodeHandler = (ctx: NodeContext) => {
           ?? "Ah, you came back. Don't even think of putting me down again.";
         publishPickup(ctx.node.id, deviceId, line, cfg.language);
         // Refill so the next pickup is also instant.
-        refillPickupCache(ctx.node.id, cfg.model, cfg.language);
+        refillPickupCache(ctx.node.id, cfg.language);
       }
       w.count = 0;
     }
