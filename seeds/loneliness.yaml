@@ -1,0 +1,22 @@
+# loneliness — passive-aggressive phone-loneliness demo.
+#
+# Watches `mobile.<id>.sensor.accel` from a connected brAIn-mobile
+# phone. When the phone has been put down (accelerometer within
+# ±max_range over window_ms), the node asks an LLM for an
+# English one-liner every utterance_period_ms and pushes it to the
+# device's TTS on mobile.<id>.tts.speak — until the phone moves again.
+#
+# Requires a brAIn-mobile instance publishing accelerometer data;
+# without it the node sits idle (the seed will still apply cleanly).
+
+nodes:
+  - type: phone-loneliness
+    name: loneliness
+    description: "Detects an idle phone and nags it via TTS until it's picked up."
+    priority: 4
+    position: { x: 300, y: 300 }
+    config_overrides:
+      model: "ollama/gemma4:e4b"
+      max_range: 0.4
+      window_ms: 3000
+      utterance_period_ms: 15000
