@@ -172,10 +172,17 @@ function refillCache(nodeId: string, language: string, cfg: DevConfig): void {
     void (async (): Promise<void> => {
       try {
         const text = await generateUtterance(llm, language, getRecentQuips(nodeId, language), new AbortController().signal);
-        if (text && c.byLang.get(language) === queue) {
-          queue.push(text);
-          rememberQuip(nodeId, language, text);
-        }
+        if (!text) return;
+        if (c.byLang.get(language) !== queue) return;
+        queue.push(text);
+        rememberQuip(nodeId, language, text);
+        // Chain only on the success path. Recursing from `finally`
+        // would spin-loop the heap when the LLM rejects fast (no
+        // provider, network down) — the 2s prewarm timer handles the
+        // retry instead, giving natural backoff.
+        const live = getCurrentConfigForNode(nodeId, cfg);
+        if (live.language !== language) return;
+        refillCache(nodeId, language, live);
       } catch (err) {
         publishStatus(nodeId, "__cache__", {
           state: "cache.error",
@@ -185,10 +192,6 @@ function refillCache(nodeId: string, language: string, cfg: DevConfig): void {
       } finally {
         c.inflight.set(language, Math.max(0, (c.inflight.get(language) ?? 1) - 1));
         publishCacheSnapshot(nodeId, c, cfg.cache_target);
-        // Chain — if the queue still isn't full and we have spare slots,
-        // spin up another refill round.
-        const live = getCurrentConfigForNode(nodeId, cfg);
-        if (live.language === language) refillCache(nodeId, language, live);
       }
     })();
   }
