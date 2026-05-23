@@ -198,7 +198,7 @@
   </main>
 
   <script>
-    const nodeId = window.location.pathname.split('/nodes/')[1]?.split('/ui')[0];
+    const nodeId = window.location.pathname.split('/node/')[1]?.split('/ui')[0];
     const apiBase = window.location.origin;
 
     const els = {
@@ -269,7 +269,7 @@
 
     async function pollMessages() {
       try {
-        const res = await fetch(`${apiBase}/nodes/${nodeId}/ui/messages`);
+        const res = await fetch(`${apiBase}/node/${nodeId}/messages`);
         if (!res.ok) { els.status.textContent = 'node not running'; return; }
         const messages = await res.json();
         let startIdx = 0;
