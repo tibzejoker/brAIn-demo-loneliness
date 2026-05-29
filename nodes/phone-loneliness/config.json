@@ -1,29 +1,70 @@
 {
   "name": "phone-loneliness",
   "description": "Detects when a brAIn-mobile phone has been put down (accelerometer steady within ±max_range over window_ms), then asks an LLM for a passive-aggressive English one-liner every utterance_period_ms and pushes it to the device's TTS — until the phone moves again.",
-  "tags": ["demo", "fun", "mobile", "llm", "tts"],
+  "tags": [
+    "demo",
+    "fun",
+    "mobile",
+    "llm",
+    "tts"
+  ],
   "default_authority": 1,
   "default_priority": 4,
-  "default_subscriptions": [
-    {
-      "topic": "mobile.*",
-      "description": "Greedy prefix that picks up every brAIn-mobile topic. We only act on `mobile.<id>.sensor.accel` — but brAIn's topic matcher requires the wildcard at the tail, so we filter inside the handler.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "x": { "type": "number" },
-          "y": { "type": "number" },
-          "z": { "type": "number" },
-          "t": { "type": "number" }
+  "ports": {
+    "inputs": {
+      "mobile.*": {
+        "description": "Greedy prefix that picks up every brAIn-mobile topic. We only act on `mobile.<id>.sensor.accel` — but brAIn's topic matcher requires the wildcard at the tail, so we filter inside the handler.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "number"
+            },
+            "y": {
+              "type": "number"
+            },
+            "z": {
+              "type": "number"
+            },
+            "t": {
+              "type": "number"
+            }
+          }
         }
       }
+    },
+    "outputs": {
+      "phone-loneliness.status": {
+        "description": "phone-loneliness.status"
+      },
+      "phone-loneliness.cache": {
+        "description": "phone-loneliness.cache"
+      },
+      "mobile.*.tts.speak": {
+        "description": "mobile.*.tts.speak"
+      }
     }
-  ],
-  "default_publishes": [
-    "phone-loneliness.status",
-    "phone-loneliness.cache",
-    "mobile.*.tts.speak"
-  ],
+  },
+  "default_port_bindings": {
+    "inputs": {
+      "mobile.*": [
+        "mobile.*"
+      ]
+    },
+    "outputs": {
+      "phone-loneliness.status": [
+        "phone-loneliness.status"
+      ],
+      "phone-loneliness.cache": [
+        "phone-loneliness.cache"
+      ],
+      "mobile.*.tts.speak": [
+        "mobile.*.tts.speak"
+      ]
+    }
+  },
   "has_ui": true,
-  "supports_transport": ["process"]
+  "supports_transport": [
+    "process"
+  ]
 }
