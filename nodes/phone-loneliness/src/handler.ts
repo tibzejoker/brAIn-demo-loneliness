@@ -1,5 +1,6 @@
 import type { NodeContext, NodeHandler, NodeOnSpawn, NodeTeardown, NodeInfo, TextPayload, Message, LLMFacade } from "@brain/sdk";
-import { BrainService } from "@brain/core";
+import { BrainService, LLMFacade as CoreLLMFacade, getNodeDataRoot } from "@brain/core";
+import * as path from "path";
 import { StillnessDetector, type AccelSample } from "./stillness";
 
 // Cache the LLMFacade per-node so background cache-refill tasks can
@@ -616,12 +617,41 @@ function getCurrentConfigForNode(nodeId: string, fallback: DevConfig): DevConfig
 const prewarmTimers = new Map<string, NodeJS.Timeout>();
 const PREWARM_INTERVAL_MS = 2000;
 
+/**
+ * Build (once) a standalone LLM facade from the process-wide framework deps,
+ * so the cache can pre-warm at spawn WITHOUT waiting for a phone to connect.
+ * Previously the facade was only captured from `ctx.llm` inside the handler,
+ * which only fires on inbound `mobile.*` samples — so refillCache no-op'd and
+ * the cache stayed empty until the first phone message. Helpers override the
+ * `signal` per call, so the never-aborting one here is just a placeholder.
+ */
+function ensureFacade(info: NodeInfo): void {
+  if (facades.has(info.id)) return;
+  const brain = BrainService.current;
+  if (!brain?.llmConfig) return; // framework not ready yet — retried by the timer
+  facades.set(info.id, new CoreLLMFacade({
+    registry: brain.llm,
+    config: brain.llmConfig,
+    bus: brain.bus,
+    nodeId: info.id,
+    nodeName: info.name,
+    nodeType: info.type,
+    nodeModel: info.config_overrides?.model as string | undefined,
+    nodeCli: info.config_overrides?.cli as string | undefined,
+    nodeDataDir: path.join(getNodeDataRoot(), info.id),
+    signal: new AbortController().signal,
+  }));
+}
+
 export const onSpawn: NodeOnSpawn = (info: NodeInfo) => {
   // Ensure the watcher map slot exists and is empty for this instance.
   watchers.set(info.id, new Map());
   // Pre-warm both caches for the configured language so the first
-  // put-down AND the first pickup-line have zero LLM latency.
+  // put-down AND the first pickup-line have zero LLM latency. Build the LLM
+  // facade up front so the refill actually runs now (not only once a phone
+  // connects and the handler captures ctx.llm).
   const cfg = getConfig(info.config_overrides ?? {});
+  ensureFacade(info);
   refillCache(info.id, cfg.language, cfg);
   refillPickupCache(info.id, cfg.language);
   // Publish a snapshot right away so a dashboard opened just after spawn
@@ -633,6 +663,7 @@ export const onSpawn: NodeOnSpawn = (info: NodeInfo) => {
   // populate the new language within a couple of seconds.
   const timer = setInterval(() => {
     const live = getCurrentConfigForNode(info.id, cfg);
+    ensureFacade(info); // retry in case BrainService wasn't ready at spawn
     refillCache(info.id, live.language, live);
     refillPickupCache(info.id, live.language);
     // Heartbeat: always re-publish, even when the cache is already full and
