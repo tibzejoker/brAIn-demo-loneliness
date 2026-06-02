@@ -624,6 +624,10 @@ export const onSpawn: NodeOnSpawn = (info: NodeInfo) => {
   const cfg = getConfig(info.config_overrides ?? {});
   refillCache(info.id, cfg.language, cfg);
   refillPickupCache(info.id, cfg.language);
+  // Publish a snapshot right away so a dashboard opened just after spawn
+  // immediately sees the cache map (its target + current/filling state),
+  // instead of a blank panel until the first refill lands.
+  publishCacheSnapshot(info.id, getCache(info.id), cfg.cache_target);
   // Keep the cache warm even with no phone connected — picks up the
   // current `language` override on each tick so dropdown changes
   // populate the new language within a couple of seconds.
@@ -631,6 +635,11 @@ export const onSpawn: NodeOnSpawn = (info: NodeInfo) => {
     const live = getCurrentConfigForNode(info.id, cfg);
     refillCache(info.id, live.language, live);
     refillPickupCache(info.id, live.language);
+    // Heartbeat: always re-publish, even when the cache is already full and
+    // no refill happened. Otherwise a dashboard reloaded in steady state
+    // never receives a snapshot and shows an empty cache map. This guarantees
+    // the UI reflects the real state within one interval of (re)loading.
+    publishCacheSnapshot(info.id, getCache(info.id), live.cache_target);
   }, PREWARM_INTERVAL_MS);
   prewarmTimers.set(info.id, timer);
 };
