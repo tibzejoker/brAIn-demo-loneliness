@@ -15,6 +15,9 @@ interface DeviceWatcher {
   utteranceTimer: NodeJS.Timeout | null;
   inflight: boolean;
   count: number;
+  /** Wall-clock ms of the most recent accel sample — drives the
+   *  disconnect timeout so the UI drops a phone that stopped reporting. */
+  lastSampleAt: number;
   /** Have we emitted the initial "tracking" status for this device yet? */
   announced: boolean;
   /**
@@ -480,6 +483,7 @@ function getOrCreateWatcher(nodeId: string, deviceId: string, cfg: DevConfig): D
       utteranceTimer: null,
       inflight: false,
       count: 0,
+      lastSampleAt: Date.now(),
       announced: false,
       awaitingTts: null,
       flashDance: null,
@@ -616,6 +620,35 @@ function getCurrentConfigForNode(nodeId: string, fallback: DevConfig): DevConfig
 // trigger the cache for a freshly-picked language sits empty forever.
 const prewarmTimers = new Map<string, NodeJS.Timeout>();
 const PREWARM_INTERVAL_MS = 2000;
+/** Drop a phone from the UI once it has been silent this long. */
+const DEVICE_TIMEOUT_MS = 4000;
+
+/**
+ * Re-publish each live device's motion state (still = put down / active = in
+ * motion) every tick. The handler only emits status on transitions, which get
+ * buried under the accel + cache stream and drop the device off the panel —
+ * so the UI showed "no phone" even while gyro samples poured in. This keeps
+ * the device + its current state visible, and drops phones that went silent.
+ */
+function heartbeatDevices(nodeId: string): void {
+  const perNode = watchers.get(nodeId);
+  if (!perNode) return;
+  const now = Date.now();
+  for (const [deviceId, w] of perNode) {
+    if (now - w.lastSampleAt > DEVICE_TIMEOUT_MS) {
+      if (w.utteranceTimer) { clearTimeout(w.utteranceTimer); w.utteranceTimer = null; }
+      stopFlashDance(nodeId, deviceId, w);
+      perNode.delete(deviceId);
+      publishStatus(nodeId, deviceId, { state: "disconnected" });
+    } else {
+      publishStatus(nodeId, deviceId, {
+        state: w.detector.isStill ? "still" : "active",
+        since: w.detector.stillSince,
+        count: w.count,
+      });
+    }
+  }
+}
 
 /**
  * Build (once) a standalone LLM facade from the process-wide framework deps,
@@ -671,6 +704,9 @@ export const onSpawn: NodeOnSpawn = (info: NodeInfo) => {
     // never receives a snapshot and shows an empty cache map. This guarantees
     // the UI reflects the real state within one interval of (re)loading.
     publishCacheSnapshot(info.id, getCache(info.id), live.cache_target);
+    // Keep each connected phone's motion state (still / in-motion) fresh in
+    // the UI, and drop phones that stopped reporting.
+    heartbeatDevices(info.id);
   }, PREWARM_INTERVAL_MS);
   prewarmTimers.set(info.id, timer);
 };
@@ -738,6 +774,7 @@ export const handler: NodeHandler = (ctx: NodeContext) => {
     refillPickupCache(ctx.node.id, cfg.language);
 
     const w = getOrCreateWatcher(ctx.node.id, deviceId, cfg);
+    w.lastSampleAt = Date.now();
     if (!w.announced) {
       // Surface the device in the UI immediately, before we have enough
       // samples to make a stillness call. Otherwise the panel sits on
