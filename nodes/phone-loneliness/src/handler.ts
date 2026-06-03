@@ -306,11 +306,23 @@ function publishFlash(nodeId: string, deviceId: string, on: boolean): void {
 
 /** Erratic on/off cadence while the phone speaks — picked up + spoken
  *  events both call stopFlashDance which guarantees a final {on: false}. */
+/** Hard cap on a single flash episode. Speaking never takes this long; the cap
+ *  guarantees the strobe can't run forever if the phone never reports it
+ *  finished (tts.status) or the node was torn down without clearing the timer. */
+const FLASH_MAX_MS = 20_000;
+
 function startFlashDance(nodeId: string, deviceId: string, w: DeviceWatcher): void {
   stopFlashDance(nodeId, deviceId, w);
+  const startedAt = Date.now();
   w.flashDance = { timer: null, on: false };
   const step = (): void => {
     if (!w.flashDance) return;
+    // Self-heal: never strobe the bus forever. Stop if this node is gone (an
+    // orphaned timer after a kill) or the episode ran absurdly long.
+    if (Date.now() - startedAt > FLASH_MAX_MS || !BrainService.current?.instanceRegistry.get(nodeId)) {
+      stopFlashDance(nodeId, deviceId, w);
+      return;
+    }
     w.flashDance.on = !w.flashDance.on;
     publishFlash(nodeId, deviceId, w.flashDance.on);
     // Random dwell — short blinks (40-180 ms) when on, longer dark
