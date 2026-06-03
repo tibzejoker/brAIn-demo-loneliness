@@ -58,7 +58,12 @@ export class StillnessDetector {
   feed(s: AccelSample): { changed: boolean; isStill: boolean } {
     this.buffer.push(s);
     const cutoff = s.t - this.windowMs;
-    while (this.buffer.length > 0 && this.buffer[0].t < cutoff) {
+    // Keep ONE sample older than the window boundary, so the buffer's span
+    // actually reaches `windowMs`. With irregular sample spacing (real sensor
+    // jitter, or a throttled stream) the cutoff rarely lands exactly on a
+    // sample, so trimming everything older than it left span strictly below
+    // windowMs forever — and the verdict never flipped to "still".
+    while (this.buffer.length > 1 && this.buffer[1].t < cutoff) {
       this.buffer.shift();
     }
 

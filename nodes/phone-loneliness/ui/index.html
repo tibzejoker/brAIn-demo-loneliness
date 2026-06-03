@@ -308,11 +308,22 @@
         appendLog(deviceId, meta.text, meta.language ?? 'en-US', msg.timestamp, 'pickup');
         return;
       }
-      const cur = devices.get(deviceId) ?? { state: 'unknown', count: 0, language: 'en-US' };
+      // Phone went silent — the node dropped it, so drop it here too.
+      if (meta.state === 'disconnected') {
+        devices.delete(deviceId);
+        renderDevices();
+        return;
+      }
+      const cur = devices.get(deviceId) ?? { state: 'unknown', motion: 'moving', count: 0, language: 'en-US' };
       cur.state = meta.state ?? cur.state;
       cur.count = meta.count ?? cur.count;
       cur.since = meta.since ?? cur.since;
       cur.language = meta.language ?? cur.language;
+      // The motion badge is driven ONLY by the heartbeat states, so a transient
+      // "uttered" / "exhausted" (which fire while the phone is put down) never
+      // flips the badge to "in motion".
+      if (meta.state === 'still') cur.motion = 'still';
+      else if (meta.state === 'active' || meta.state === 'tracking') cur.motion = 'moving';
       devices.set(deviceId, cur);
       renderDevices();
       if (meta.state === 'uttered' && typeof meta.text === 'string') {
@@ -332,10 +343,15 @@
       for (const [id, d] of devices) {
         const div = document.createElement('div');
         div.className = 'device';
+        const still = d.motion === 'still';
+        const secs = still && d.since ? Math.max(0, Math.round((Date.now() - d.since) / 1000)) : 0;
+        const label = still
+          ? `📴 Posé${secs ? ` depuis ${secs}s` : ''}`
+          : '📱 En mouvement';
         div.innerHTML = `
           <div class="id">${escapeHtml(id)}</div>
           <div class="badges">
-            <span class="badge ${escapeHtml(d.state)}">${escapeHtml(d.state)}</span>
+            <span class="badge ${still ? 'still' : 'active'}">${label}</span>
             ${d.count ? `<span class="badge muted">${d.count} quip${d.count > 1 ? 's' : ''}</span>` : ''}
           </div>
         `;
