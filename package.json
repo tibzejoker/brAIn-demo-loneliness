@@ -3,6 +3,12 @@
   "private": true,
   "license": "MIT",
   "description": "brAIn demo — a passive-aggressive phone that begs to be picked up. Showcases mobile sensor → bus → LLM → mobile TTS in one ~150 LOC node.",
-  "scripts": { "build": "pnpm -r build" },
-  "devDependencies": { "@types/node": "^20.11.0", "typescript": "^5.4.0" }
+  "scripts": {
+    "build": "pnpm -r build"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  },
+  "version": "1.0.0"
 }
